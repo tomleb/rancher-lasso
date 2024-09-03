@@ -7,6 +7,7 @@ import (
 
 	"github.com/rancher/lasso/pkg/cache"
 	"github.com/rancher/lasso/pkg/client"
+	"go.opentelemetry.io/otel/trace"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	cachetools "k8s.io/client-go/tools/cache"
@@ -16,10 +17,15 @@ type SharedControllerHandler interface {
 	OnChange(key string, obj runtime.Object) (runtime.Object, error)
 }
 
+type SharedControllerHandlerContext interface {
+	OnChangeWithContext(ctx context.Context, key string, obj runtime.Object) (runtime.Object, error)
+}
+
 type SharedController interface {
 	Controller
 
 	RegisterHandler(ctx context.Context, name string, handler SharedControllerHandler)
+	RegisterHandlerContext(ctx context.Context, name string, handler SharedControllerHandlerContext)
 	Client() *client.Client
 }
 
@@ -27,6 +33,12 @@ type SharedControllerHandlerFunc func(key string, obj runtime.Object) (runtime.O
 
 func (s SharedControllerHandlerFunc) OnChange(key string, obj runtime.Object) (runtime.Object, error) {
 	return s(key, obj)
+}
+
+type SharedControllerHandlerContextFunc func(ctx context.Context, key string, obj runtime.Object) (runtime.Object, error)
+
+func (s SharedControllerHandlerContextFunc) OnChangeWithContext(ctx context.Context, key string, obj runtime.Object) (runtime.Object, error) {
+	return s(ctx, key, obj)
 }
 
 type sharedController struct {
@@ -47,12 +59,24 @@ func (s *sharedController) Enqueue(namespace, name string) {
 	s.initController().Enqueue(namespace, name)
 }
 
+func (s *sharedController) EnqueueWithTrace(namespace, name string, spanCtx *trace.SpanContext) {
+	s.initController().EnqueueWithTrace(namespace, name, spanCtx)
+}
+
 func (s *sharedController) EnqueueAfter(namespace, name string, delay time.Duration) {
 	s.initController().EnqueueAfter(namespace, name, delay)
 }
 
+func (s *sharedController) EnqueueAfterWithTrace(namespace, name string, delay time.Duration, spanCtx *trace.SpanContext) {
+	s.initController().EnqueueAfterWithTrace(namespace, name, delay, spanCtx)
+}
+
 func (s *sharedController) EnqueueKey(key string) {
 	s.initController().EnqueueKey(key)
+}
+
+func (s *sharedController) EnqueueKeyWithTrace(key string, spanCtx *trace.SpanContext) {
+	s.initController().EnqueueKeyWithTrace(key, spanCtx)
 }
 
 func (s *sharedController) Informer() cachetools.SharedIndexInformer {
@@ -109,11 +133,18 @@ func (s *sharedController) Start(ctx context.Context, workers int) error {
 }
 
 func (s *sharedController) RegisterHandler(ctx context.Context, name string, handler SharedControllerHandler) {
+	handlerContext := func(_ context.Context, key string, obj runtime.Object) (runtime.Object, error) {
+		return handler.OnChange(key, obj)
+	}
+	s.RegisterHandlerContext(ctx, name, SharedControllerHandlerContextFunc(handlerContext))
+}
+
+func (s *sharedController) RegisterHandlerContext(ctx context.Context, name string, handler SharedControllerHandlerContext) {
 	// Ensure that controller is initialized
 	c := s.initController()
 
 	getHandlerTransaction(ctx).do(func() {
-		s.handler.Register(ctx, name, handler)
+		s.handler.RegisterContext(ctx, name, handler)
 
 		s.startLock.Lock()
 		defer s.startLock.Unlock()
