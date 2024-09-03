@@ -13,19 +13,28 @@ import (
 
 	"github.com/rancher/lasso/pkg/log"
 	"github.com/rancher/lasso/pkg/metrics"
+	"github.com/rancher/lasso/pkg/workqueue"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/tools/cache"
-	"k8s.io/client-go/util/workqueue"
+	kworkqueue "k8s.io/client-go/util/workqueue"
 )
 
 const maxTimeout2min = 2 * time.Minute
 
 type Handler interface {
 	OnChange(key string, obj runtime.Object) error
+}
+
+type HandlerContext interface {
+	OnChangeWithContext(ctx context.Context, key string, obj runtime.Object) error
 }
 
 type ResourceVersionGetter interface {
@@ -38,10 +47,19 @@ func (h HandlerFunc) OnChange(key string, obj runtime.Object) error {
 	return h(key, obj)
 }
 
+type HandlerContextFunc func(ctx context.Context, key string, obj runtime.Object) error
+
+func (h HandlerContextFunc) OnChangeWithContext(ctx context.Context, key string, obj runtime.Object) error {
+	return h(ctx, key, obj)
+}
+
 type Controller interface {
 	Enqueue(namespace, name string)
+	EnqueueWithTrace(namespace, name string, trace *trace.SpanContext)
 	EnqueueAfter(namespace, name string, delay time.Duration)
+	EnqueueAfterWithTrace(namespace, name string, delay time.Duration, trace *trace.SpanContext)
 	EnqueueKey(key string)
+	EnqueueKeyWithTrace(key string, trace *trace.SpanContext)
 	Informer() cache.SharedIndexInformer
 	Start(ctx context.Context, workers int) error
 }
@@ -51,26 +69,37 @@ type controller struct {
 
 	name        string
 	workqueue   workqueue.RateLimitingInterface
-	rateLimiter workqueue.RateLimiter
+	rateLimiter kworkqueue.RateLimiter
 	informer    cache.SharedIndexInformer
-	handler     Handler
+	handler     HandlerContext
 	gvk         schema.GroupVersionKind
 	startKeys   []startKey
 	started     bool
 	startCache  func(context.Context) error
+
+	tracer trace.Tracer
 }
 
 type startKey struct {
 	key   string
+	trace any
 	after time.Duration
 }
 
 type Options struct {
-	RateLimiter            workqueue.RateLimiter
+	RateLimiter            kworkqueue.RateLimiter
 	SyncOnlyChangedObjects bool
+	Tracer                 trace.Tracer
 }
 
 func New(name string, informer cache.SharedIndexInformer, startCache func(context.Context) error, handler Handler, opts *Options) Controller {
+	handlerContext := func(_ context.Context, key string, obj runtime.Object) error {
+		return handler.OnChange(key, obj)
+	}
+	return NewWithContext(name, informer, startCache, HandlerContextFunc(handlerContext), opts)
+}
+
+func NewWithContext(name string, informer cache.SharedIndexInformer, startCache func(context.Context) error, handler HandlerContext, opts *Options) Controller {
 	opts = applyDefaultOptions(opts)
 
 	controller := &controller{
@@ -79,6 +108,8 @@ func New(name string, informer cache.SharedIndexInformer, startCache func(contex
 		informer:    informer,
 		rateLimiter: opts.RateLimiter,
 		startCache:  startCache,
+
+		tracer: opts.Tracer,
 	}
 
 	informer.AddEventHandler(cache.ResourceEventHandlerFuncs{
@@ -106,9 +137,9 @@ func applyDefaultOptions(opts *Options) *Options {
 	// from failure 13 to 30: 30s delay
 	// from failure 31 on: 120s delay (2 minutes)
 	if newOpts.RateLimiter == nil {
-		newOpts.RateLimiter = workqueue.NewMaxOfRateLimiter(
-			workqueue.NewItemFastSlowRateLimiter(time.Millisecond, maxTimeout2min, 30),
-			workqueue.NewItemExponentialFailureRateLimiter(5*time.Millisecond, 30*time.Second),
+		newOpts.RateLimiter = kworkqueue.NewMaxOfRateLimiter(
+			kworkqueue.NewItemFastSlowRateLimiter(time.Millisecond, maxTimeout2min, 30),
+			kworkqueue.NewItemExponentialFailureRateLimiter(5*time.Millisecond, 30*time.Second),
 		)
 	}
 	return &newOpts
@@ -128,12 +159,32 @@ func (c *controller) run(workers int, stopCh <-chan struct{}) {
 	// will create a goroutine under the hood.  It we instantiate a workqueue we must have
 	// a mechanism to Shutdown it down.  Without the stopCh we don't know when to shutdown
 	// the queue and release the goroutine
-	c.workqueue = workqueue.NewNamedRateLimitingQueue(c.rateLimiter, c.name)
+	c.workqueue = workqueue.NewRateLimitingQueueWithConfig(c.rateLimiter, workqueue.RateLimitingQueueConfig{
+		Name: c.name,
+		DelayingQueue: workqueue.NewDelayingQueueWithConfig(workqueue.DelayingQueueConfig{
+			Name: c.name,
+			Queue: workqueue.NewWithConfig(workqueue.QueueConfig{
+				Name: c.name,
+				CoalesceFunc: func(acc, spanCtx any) any {
+					if spanCtx == nil {
+						return acc
+					}
+
+					var list []trace.SpanContext
+					if acc != nil {
+						list = acc.([]trace.SpanContext)
+					}
+					list = append(list, *spanCtx.(*trace.SpanContext))
+					return list
+				},
+			}),
+		}),
+	})
 	for _, start := range c.startKeys {
 		if start.after == 0 {
-			c.workqueue.Add(start.key)
+			c.workqueue.AddWithTrace(start.key, start.trace)
 		} else {
-			c.workqueue.AddAfter(start.key, start.after)
+			c.workqueue.AddAfterWithTrace(start.key, start.after, start.trace)
 		}
 	}
 	c.startKeys = nil
@@ -185,13 +236,50 @@ func (c *controller) runWorker() {
 }
 
 func (c *controller) processNextWorkItem() bool {
-	obj, shutdown := c.workqueue.Get()
+	obj, shutdown, spanCtxs := c.workqueue.GetWithTrace()
+
+	traceOpts := []trace.SpanStartOption{}
+	traceOpts = append(traceOpts, trace.WithAttributes(
+		attribute.KeyValue{
+			Key:   "lasso.gvk.group",
+			Value: attribute.StringValue(c.gvk.Group),
+		},
+		attribute.KeyValue{
+			Key:   "lasso.gvk.version",
+			Value: attribute.StringValue(c.gvk.Version),
+		},
+		attribute.KeyValue{
+			Key:   "lasso.gvk.kind",
+			Value: attribute.StringValue(c.gvk.Kind),
+		},
+	))
+	if key, ok := obj.(string); ok {
+		traceOpts = append(traceOpts, trace.WithAttributes(
+			attribute.KeyValue{
+				Key:   "lasso.key",
+				Value: attribute.StringValue(key),
+			},
+		))
+	}
+	if spanCtxs != nil {
+		for _, spanCtx := range spanCtxs.([]trace.SpanContext) {
+			link := trace.Link{
+				SpanContext: spanCtx,
+			}
+			traceOpts = append(traceOpts, trace.WithLinks(link))
+		}
+	}
+
+	ctx, span := c.tracer.Start(context.Background(), "process next item", traceOpts...)
+	defer span.End()
 
 	if shutdown {
 		return false
 	}
 
-	if err := c.processSingleItem(obj); err != nil {
+	if err := c.processSingleItem(ctx, obj); err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "some error")
 		if !strings.Contains(err.Error(), "please apply your changes to the latest version and try again") {
 			log.Errorf("%v", err)
 		}
@@ -201,7 +289,7 @@ func (c *controller) processNextWorkItem() bool {
 	return true
 }
 
-func (c *controller) processSingleItem(obj interface{}) error {
+func (c *controller) processSingleItem(ctx context.Context, obj interface{}) error {
 	var (
 		key string
 		ok  bool
@@ -214,8 +302,9 @@ func (c *controller) processSingleItem(obj interface{}) error {
 		log.Errorf("expected string in workqueue but got %#v", obj)
 		return nil
 	}
-	if err := c.syncHandler(key); err != nil {
-		c.workqueue.AddRateLimited(key)
+	if err := c.syncHandler(ctx, key); err != nil {
+		spanCtx := trace.SpanContextFromContext(ctx)
+		c.workqueue.AddRateLimitedWithTrace(key, &spanCtx)
 		return fmt.Errorf("error syncing '%s': %s, requeuing", key, err.Error())
 	}
 
@@ -223,53 +312,84 @@ func (c *controller) processSingleItem(obj interface{}) error {
 	return nil
 }
 
-func (c *controller) syncHandler(key string) error {
+func (c *controller) syncHandler(parentCtx context.Context, key string) error {
 	obj, exists, err := c.informer.GetStore().GetByKey(key)
 	if err != nil {
 		metrics.IncTotalHandlerExecutions(c.name, "", true)
 		return err
 	}
 	if !exists {
-		return c.handler.OnChange(key, nil)
+		return c.handler.OnChangeWithContext(parentCtx, key, nil)
 	}
 
-	return c.handler.OnChange(key, obj.(runtime.Object))
+	acc, err := meta.Accessor(obj)
+	if err != nil {
+		return err
+	}
+
+	ctx, span := trace.SpanFromContext(parentCtx).TracerProvider().Tracer("").Start(parentCtx, "OnChange start",
+		trace.WithAttributes(
+			attribute.KeyValue{
+				Key:   "lasso.metadata.name",
+				Value: attribute.StringValue(acc.GetName()),
+			},
+			attribute.KeyValue{
+				Key:   "lasso.metadata.namespace",
+				Value: attribute.StringValue(acc.GetNamespace()),
+			},
+		),
+	)
+	defer span.End()
+
+	return c.handler.OnChangeWithContext(ctx, key, obj.(runtime.Object))
 }
 
 func (c *controller) EnqueueKey(key string) {
+	c.EnqueueKeyWithTrace(key, nil)
+}
+
+func (c *controller) EnqueueKeyWithTrace(key string, spanCtx *trace.SpanContext) {
 	c.startLock.Lock()
 	defer c.startLock.Unlock()
 
 	if c.workqueue == nil {
-		c.startKeys = append(c.startKeys, startKey{key: key})
+		c.startKeys = append(c.startKeys, startKey{key: key, trace: spanCtx})
 	} else {
-		c.workqueue.Add(key)
+		c.workqueue.AddWithTrace(key, spanCtx)
 	}
 }
 
 func (c *controller) Enqueue(namespace, name string) {
+	c.EnqueueWithTrace(namespace, name, nil)
+}
+
+func (c *controller) EnqueueWithTrace(namespace, name string, spanCtx *trace.SpanContext) {
 	key := keyFunc(namespace, name)
 
 	c.startLock.Lock()
 	defer c.startLock.Unlock()
 
 	if c.workqueue == nil {
-		c.startKeys = append(c.startKeys, startKey{key: key})
+		c.startKeys = append(c.startKeys, startKey{key: key, trace: spanCtx})
 	} else {
-		c.workqueue.AddRateLimited(key)
+		c.workqueue.AddRateLimitedWithTrace(key, spanCtx)
 	}
 }
 
 func (c *controller) EnqueueAfter(namespace, name string, duration time.Duration) {
+	c.EnqueueAfterWithTrace(namespace, name, duration, nil)
+}
+
+func (c *controller) EnqueueAfterWithTrace(namespace, name string, duration time.Duration, spanCtx *trace.SpanContext) {
 	key := keyFunc(namespace, name)
 
 	c.startLock.Lock()
 	defer c.startLock.Unlock()
 
 	if c.workqueue == nil {
-		c.startKeys = append(c.startKeys, startKey{key: key, after: duration})
+		c.startKeys = append(c.startKeys, startKey{key: key, after: duration, trace: spanCtx})
 	} else {
-		c.workqueue.AddAfter(key, duration)
+		c.workqueue.AddAfterWithTrace(key, duration, spanCtx)
 	}
 }
 
@@ -280,7 +400,7 @@ func keyFunc(namespace, name string) string {
 	return namespace + "/" + name
 }
 
-func (c *controller) enqueue(obj interface{}) {
+func (c *controller) enqueue(obj interface{}, spanCtx *trace.SpanContext) {
 	var key string
 	var err error
 	if key, err = cache.MetaNamespaceKeyFunc(obj); err != nil {
@@ -289,9 +409,9 @@ func (c *controller) enqueue(obj interface{}) {
 	}
 	c.startLock.Lock()
 	if c.workqueue == nil {
-		c.startKeys = append(c.startKeys, startKey{key: key})
+		c.startKeys = append(c.startKeys, startKey{key: key, trace: spanCtx})
 	} else {
-		c.workqueue.Add(key)
+		c.workqueue.AddWithTrace(key, spanCtx)
 	}
 	c.startLock.Unlock()
 }
@@ -310,5 +430,9 @@ func (c *controller) handleObject(obj interface{}) {
 		}
 		obj = newObj
 	}
-	c.enqueue(obj)
+	_, span := c.tracer.Start(context.Background(), "handleObject")
+	defer span.End()
+
+	spanCtx := span.SpanContext()
+	c.enqueue(obj, &spanCtx)
 }
