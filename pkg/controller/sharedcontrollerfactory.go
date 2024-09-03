@@ -6,6 +6,7 @@ import (
 
 	"github.com/rancher/lasso/pkg/cache"
 	"github.com/rancher/lasso/pkg/client"
+	"go.opentelemetry.io/otel/trace"
 	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -41,6 +42,8 @@ type SharedControllerFactoryOptions struct {
 	// that running the handler func on resync will mostly only serve the purpose of catching missed cache
 	// events.
 	SyncOnlyChangedObjects bool
+
+	Tracer trace.Tracer
 }
 
 type sharedControllerFactory struct {
@@ -55,6 +58,8 @@ type sharedControllerFactory struct {
 	kindWorkers     map[schema.GroupVersionKind]int
 
 	syncOnlyChangedObjects bool
+
+	tracer trace.Tracer
 }
 
 func NewSharedControllerFactoryFromConfig(config *rest.Config, scheme *runtime.Scheme) (SharedControllerFactory, error) {
@@ -93,6 +98,7 @@ func NewSharedControllerFactory(cacheFactory cache.SharedCacheFactory, opts *Sha
 		rateLimiter:            opts.DefaultRateLimiter,
 		kindRateLimiter:        opts.KindRateLimiter,
 		syncOnlyChangedObjects: opts.SyncOnlyChangedObjects,
+		tracer:                 opts.Tracer,
 	}
 }
 
@@ -214,9 +220,10 @@ func (s *sharedControllerFactory) ForResourceKind(gvr schema.GroupVersionResourc
 				return s.sharedCacheFactory.StartGVK(ctx, gvk)
 			}
 
-			c := New(gvk.String(), cache, starter, handler, &Options{
+			c := NewWithContext(gvk.String(), cache, starter, handler, &Options{
 				RateLimiter:            rateLimiter,
 				SyncOnlyChangedObjects: s.syncOnlyChangedObjects,
+				Tracer:                 s.tracer,
 			})
 
 			return c, err

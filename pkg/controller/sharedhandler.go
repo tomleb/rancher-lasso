@@ -11,6 +11,9 @@ import (
 	"time"
 
 	"github.com/rancher/lasso/pkg/metrics"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
 	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/runtime"
 )
@@ -22,7 +25,7 @@ var (
 type handlerEntry struct {
 	id      int64
 	name    string
-	handler SharedControllerHandler
+	handler SharedControllerHandlerContext
 }
 
 type SharedHandler struct {
@@ -35,6 +38,13 @@ type SharedHandler struct {
 }
 
 func (h *SharedHandler) Register(ctx context.Context, name string, handler SharedControllerHandler) {
+	handlerContext := func(_ context.Context, key string, obj runtime.Object) (runtime.Object, error) {
+		return handler.OnChange(key, obj)
+	}
+	h.RegisterContext(ctx, name, SharedControllerHandlerContextFunc(handlerContext))
+}
+
+func (h *SharedHandler) RegisterContext(ctx context.Context, name string, handler SharedControllerHandlerContext) {
 	h.lock.Lock()
 	defer h.lock.Unlock()
 
@@ -42,7 +52,7 @@ func (h *SharedHandler) Register(ctx context.Context, name string, handler Share
 	h.handlers = append(h.handlers, handlerEntry{
 		id:      id,
 		name:    name,
-		handler: handler,
+		handler: withTrace(name, handler),
 	})
 
 	go func() {
@@ -61,6 +71,26 @@ func (h *SharedHandler) Register(ctx context.Context, name string, handler Share
 }
 
 func (h *SharedHandler) OnChange(key string, obj runtime.Object) error {
+	return h.OnChangeWithContext(context.Background(), key, obj)
+}
+
+func withTrace(name string, handler SharedControllerHandlerContext) SharedControllerHandlerContext {
+	return SharedControllerHandlerContextFunc(func(parentCtx context.Context, key string, obj runtime.Object) (runtime.Object, error) {
+		ctx, span := trace.SpanFromContext(parentCtx).TracerProvider().Tracer("").Start(parentCtx, fmt.Sprintf("running handler %s", name),
+			trace.WithAttributes(attribute.KeyValue{Key: "lasso.controller.name", Value: attribute.StringValue(name)}),
+		)
+		defer span.End()
+
+		newObj, err := handler.OnChangeWithContext(ctx, key, obj)
+		if err != nil && !errors.Is(err, ErrIgnore) {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, "something failed")
+		}
+		return newObj, err
+	})
+}
+
+func (h *SharedHandler) OnChangeWithContext(ctx context.Context, key string, obj runtime.Object) error {
 	var (
 		errs errorList
 	)
@@ -72,7 +102,7 @@ func (h *SharedHandler) OnChange(key string, obj runtime.Object) error {
 		var hasError bool
 		reconcileStartTS := time.Now()
 
-		newObj, err := handler.handler.OnChange(key, obj)
+		newObj, err := handler.handler.OnChangeWithContext(ctx, key, obj)
 		if err != nil && !errors.Is(err, ErrIgnore) {
 			errs = append(errs, &handlerError{
 				HandlerName: handler.name,
