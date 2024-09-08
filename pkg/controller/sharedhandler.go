@@ -71,7 +71,7 @@ func (h *SharedHandler) RegisterContext(ctx context.Context, name string, handle
 }
 
 func (h *SharedHandler) OnChange(key string, obj runtime.Object) error {
-	return h.OnChangeWithContext(context.Background(), key, obj)
+	return h.OnChangeContext(context.Background(), key, obj)
 }
 
 func withTrace(name string, handler SharedControllerHandlerContext) SharedControllerHandlerContext {
@@ -81,7 +81,7 @@ func withTrace(name string, handler SharedControllerHandlerContext) SharedContro
 		)
 		defer span.End()
 
-		newObj, err := handler.OnChangeWithContext(ctx, key, obj)
+		newObj, err := handler.OnChangeContext(ctx, key, obj)
 		if err != nil && !errors.Is(err, ErrIgnore) {
 			span.RecordError(err)
 			span.SetStatus(codes.Error, "something failed")
@@ -90,7 +90,7 @@ func withTrace(name string, handler SharedControllerHandlerContext) SharedContro
 	})
 }
 
-func (h *SharedHandler) OnChangeWithContext(ctx context.Context, key string, obj runtime.Object) error {
+func (h *SharedHandler) OnChangeContext(ctx context.Context, key string, obj runtime.Object) error {
 	var (
 		errs errorList
 	)
@@ -102,7 +102,7 @@ func (h *SharedHandler) OnChangeWithContext(ctx context.Context, key string, obj
 		var hasError bool
 		reconcileStartTS := time.Now()
 
-		newObj, err := handler.handler.OnChangeWithContext(ctx, key, obj)
+		newObj, err := handler.handler.OnChangeContext(ctx, key, obj)
 		if err != nil && !errors.Is(err, ErrIgnore) {
 			errs = append(errs, &handlerError{
 				HandlerName: handler.name,

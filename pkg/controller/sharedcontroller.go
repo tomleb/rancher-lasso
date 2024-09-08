@@ -18,15 +18,19 @@ type SharedControllerHandler interface {
 }
 
 type SharedControllerHandlerContext interface {
-	OnChangeWithContext(ctx context.Context, key string, obj runtime.Object) (runtime.Object, error)
+	OnChangeContext(ctx context.Context, key string, obj runtime.Object) (runtime.Object, error)
 }
 
 type SharedController interface {
 	Controller
 
 	RegisterHandler(ctx context.Context, name string, handler SharedControllerHandler)
-	RegisterHandlerContext(ctx context.Context, name string, handler SharedControllerHandlerContext)
 	Client() *client.Client
+}
+
+type SharedControllerContext interface {
+	SharedController
+	RegisterHandlerContext(ctx context.Context, name string, handler SharedControllerHandlerContext)
 }
 
 type SharedControllerHandlerFunc func(key string, obj runtime.Object) (runtime.Object, error)
@@ -37,7 +41,7 @@ func (s SharedControllerHandlerFunc) OnChange(key string, obj runtime.Object) (r
 
 type SharedControllerHandlerContextFunc func(ctx context.Context, key string, obj runtime.Object) (runtime.Object, error)
 
-func (s SharedControllerHandlerContextFunc) OnChangeWithContext(ctx context.Context, key string, obj runtime.Object) (runtime.Object, error) {
+func (s SharedControllerHandlerContextFunc) OnChangeContext(ctx context.Context, key string, obj runtime.Object) (runtime.Object, error) {
 	return s(ctx, key, obj)
 }
 
