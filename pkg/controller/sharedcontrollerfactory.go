@@ -23,6 +23,14 @@ type SharedControllerFactory interface {
 	Start(ctx context.Context, workers int) error
 }
 
+type SharedControllerFactoryContext interface {
+	SharedControllerFactory
+	ForObjectContext(obj runtime.Object) (SharedControllerContext, error)
+	ForKindContext(gvk schema.GroupVersionKind) (SharedControllerContext, error)
+	ForResourceContext(gvr schema.GroupVersionResource, namespaced bool) SharedControllerContext
+	ForResourceKindContext(gvr schema.GroupVersionResource, kind string, namespaced bool) SharedControllerContext
+}
+
 type SharedControllerFactoryOptions struct {
 	CacheOptions *cache.SharedCacheFactoryOptions
 
@@ -89,6 +97,10 @@ func NewSharedControllerFactoryFromConfigWithOptions(config *rest.Config, scheme
 }
 
 func NewSharedControllerFactory(cacheFactory cache.SharedCacheFactory, opts *SharedControllerFactoryOptions) SharedControllerFactory {
+	return NewSharedControllerFactoryContext(cacheFactory, opts)
+}
+
+func NewSharedControllerFactoryContext(cacheFactory cache.SharedCacheFactory, opts *SharedControllerFactoryOptions) SharedControllerFactoryContext {
 	opts = applyDefaultSharedOptions(opts)
 	return &sharedControllerFactory{
 		sharedCacheFactory:     cacheFactory,
@@ -102,6 +114,20 @@ func NewSharedControllerFactory(cacheFactory cache.SharedCacheFactory, opts *Sha
 	}
 }
 
+func NewSharedControllerFactoryContextFromConfigWithOptions(config *rest.Config, scheme *runtime.Scheme, opts *SharedControllerFactoryOptions) (SharedControllerFactoryContext, error) {
+	cf, err := client.NewSharedClientFactory(config, &client.SharedClientFactoryOptions{
+		Scheme: scheme,
+	})
+	if err != nil {
+		return nil, err
+	}
+	var cacheOpts *cache.SharedCacheFactoryOptions
+	if opts != nil {
+		cacheOpts = opts.CacheOptions
+	}
+	return NewSharedControllerFactoryContext(cache.NewSharedCachedFactory(cf, cacheOpts), opts), nil
+}
+
 func applyDefaultSharedOptions(opts *SharedControllerFactoryOptions) *SharedControllerFactoryOptions {
 	var newOpts SharedControllerFactoryOptions
 	if opts != nil {
@@ -112,6 +138,8 @@ func applyDefaultSharedOptions(opts *SharedControllerFactoryOptions) *SharedCont
 	}
 	return &newOpts
 }
+
+var _ SharedControllerFactory = (*sharedControllerFactory)(nil)
 
 func (s *sharedControllerFactory) EnableSyncOnlyChangedObjects() {
 	s.syncOnlyChangedObjects = true
@@ -152,27 +180,43 @@ func (s *sharedControllerFactory) Start(ctx context.Context, defaultWorkers int)
 }
 
 func (s *sharedControllerFactory) ForObject(obj runtime.Object) (SharedController, error) {
+	return s.ForObjectContext(obj)
+}
+
+func (s *sharedControllerFactory) ForObjectContext(obj runtime.Object) (SharedControllerContext, error) {
 	gvk, err := s.sharedCacheFactory.SharedClientFactory().GVKForObject(obj)
 	if err != nil {
 		return nil, err
 	}
-	return s.ForKind(gvk)
+	return s.ForKindContext(gvk)
 }
 
 func (s *sharedControllerFactory) ForKind(gvk schema.GroupVersionKind) (SharedController, error) {
+	return s.ForKindContext(gvk)
+}
+
+func (s *sharedControllerFactory) ForKindContext(gvk schema.GroupVersionKind) (SharedControllerContext, error) {
 	gvr, nsed, err := s.sharedCacheFactory.SharedClientFactory().ResourceForGVK(gvk)
 	if err != nil {
 		return nil, err
 	}
 
-	return s.ForResourceKind(gvr, gvk.Kind, nsed), nil
+	return s.ForResourceKindContext(gvr, gvk.Kind, nsed), nil
 }
 
 func (s *sharedControllerFactory) ForResource(gvr schema.GroupVersionResource, namespaced bool) SharedController {
-	return s.ForResourceKind(gvr, "", namespaced)
+	return s.ForResourceContext(gvr, namespaced)
+}
+
+func (s *sharedControllerFactory) ForResourceContext(gvr schema.GroupVersionResource, namespaced bool) SharedControllerContext {
+	return s.ForResourceKindContext(gvr, "", namespaced)
 }
 
 func (s *sharedControllerFactory) ForResourceKind(gvr schema.GroupVersionResource, kind string, namespaced bool) SharedController {
+	return s.ForResourceKindContext(gvr, kind, namespaced)
+}
+
+func (s *sharedControllerFactory) ForResourceKindContext(gvr schema.GroupVersionResource, kind string, namespaced bool) SharedControllerContext {
 	controllerResult := s.byResource(gvr)
 	if controllerResult != nil {
 		return controllerResult

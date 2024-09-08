@@ -66,3 +66,75 @@ func (s *sharedControllerWithAgent) Client() *client.Client {
 	}
 	return clientWithAgent
 }
+
+var _ SharedControllerFactoryContext = (*sharedControllerFactoryContextWithAgent)(nil)
+
+type sharedControllerFactoryContextWithAgent struct {
+	SharedControllerFactoryContext
+
+	userAgent string
+}
+
+func NewSharedControllerFactoryContextWithAgent(userAgent string, clientFactory SharedControllerFactoryContext) SharedControllerFactoryContext {
+	return &sharedControllerFactoryContextWithAgent{
+		SharedControllerFactoryContext: clientFactory,
+		userAgent:                      userAgent,
+	}
+}
+
+func (s *sharedControllerFactoryContextWithAgent) ForKind(gvk schema.GroupVersionKind) (SharedController, error) {
+	return s.ForKindContext(gvk)
+}
+
+func (s *sharedControllerFactoryContextWithAgent) ForResource(gvr schema.GroupVersionResource, namespaced bool) SharedController {
+	return s.ForResourceContext(gvr, namespaced)
+}
+
+func (s *sharedControllerFactoryContextWithAgent) ForResourceKind(gvr schema.GroupVersionResource, kind string, namespaced bool) SharedController {
+	return s.ForResourceKindContext(gvr, kind, namespaced)
+}
+
+func (s *sharedControllerFactoryContextWithAgent) ForKindContext(gvk schema.GroupVersionKind) (SharedControllerContext, error) {
+	resourceController, err := s.SharedControllerFactoryContext.ForKindContext(gvk)
+	if err != nil {
+		return resourceController, err
+	}
+
+	return NewSharedControllerContextWithAgent(s.userAgent, resourceController), err
+}
+
+func (s *sharedControllerFactoryContextWithAgent) ForResourceContext(gvr schema.GroupVersionResource, namespaced bool) SharedControllerContext {
+	resourceController := s.SharedControllerFactoryContext.ForResourceContext(gvr, namespaced)
+	return NewSharedControllerContextWithAgent(s.userAgent, resourceController)
+}
+
+func (s *sharedControllerFactoryContextWithAgent) ForResourceKindContext(gvr schema.GroupVersionResource, kind string, namespaced bool) SharedControllerContext {
+	resourceController := s.SharedControllerFactoryContext.ForResourceKindContext(gvr, kind, namespaced)
+	return NewSharedControllerContextWithAgent(s.userAgent, resourceController)
+}
+
+type sharedControllerContextWithAgent struct {
+	SharedControllerContext
+
+	userAgent string
+}
+
+func NewSharedControllerContextWithAgent(userAgent string, controller SharedControllerContext) SharedControllerContext {
+	return &sharedControllerContextWithAgent{
+		SharedControllerContext: controller,
+		userAgent:               userAgent,
+	}
+}
+
+func (s *sharedControllerContextWithAgent) Client() *client.Client {
+	client := s.SharedControllerContext.Client()
+	if client == nil {
+		return client
+	}
+	clientWithAgent, err := client.WithAgent(s.userAgent)
+	if err != nil {
+		log.Debugf("failed to get client with agent [%s]", s.userAgent)
+		return client
+	}
+	return clientWithAgent
+}

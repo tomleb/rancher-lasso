@@ -34,7 +34,7 @@ type Handler interface {
 }
 
 type HandlerContext interface {
-	OnChangeWithContext(ctx context.Context, key string, obj runtime.Object) error
+	OnChangeContext(ctx context.Context, key string, obj runtime.Object) error
 }
 
 type ResourceVersionGetter interface {
@@ -49,7 +49,7 @@ func (h HandlerFunc) OnChange(key string, obj runtime.Object) error {
 
 type HandlerContextFunc func(ctx context.Context, key string, obj runtime.Object) error
 
-func (h HandlerContextFunc) OnChangeWithContext(ctx context.Context, key string, obj runtime.Object) error {
+func (h HandlerContextFunc) OnChangeContext(ctx context.Context, key string, obj runtime.Object) error {
 	return h(ctx, key, obj)
 }
 
@@ -328,7 +328,7 @@ func (c *controller) syncHandler(parentCtx context.Context, key string) error {
 		return err
 	}
 	if !exists {
-		return c.handler.OnChangeWithContext(parentCtx, key, nil)
+		return c.handler.OnChangeContext(parentCtx, key, nil)
 	}
 
 	acc, err := meta.Accessor(obj)
@@ -350,7 +350,7 @@ func (c *controller) syncHandler(parentCtx context.Context, key string) error {
 	)
 	defer span.End()
 
-	return c.handler.OnChangeWithContext(ctx, key, obj.(runtime.Object))
+	return c.handler.OnChangeContext(ctx, key, obj.(runtime.Object))
 }
 
 func (c *controller) EnqueueKey(key string) {
