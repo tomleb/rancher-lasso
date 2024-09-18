@@ -90,6 +90,7 @@ type Options struct {
 	RateLimiter            kworkqueue.RateLimiter
 	SyncOnlyChangedObjects bool
 	Tracer                 trace.Tracer
+	GVK                    schema.GroupVersionKind
 }
 
 func New(name string, informer cache.SharedIndexInformer, startCache func(context.Context) error, handler Handler, opts *Options) Controller {
@@ -114,6 +115,7 @@ func NewWithContext(name string, informer cache.SharedIndexInformer, startCache 
 		startCache:  startCache,
 
 		tracer: tracer,
+		gvk:    opts.GVK,
 	}
 
 	informer.AddEventHandler(cache.ResourceEventHandlerFuncs{
@@ -247,19 +249,20 @@ func (c *controller) runWorker() {
 func (c *controller) processNextWorkItem() bool {
 	obj, shutdown, spanCtxs := c.workqueue.GetWithTrace()
 
+	gvk := c.GroupVersionKind()
 	traceOpts := []trace.SpanStartOption{}
 	traceOpts = append(traceOpts, trace.WithAttributes(
 		attribute.KeyValue{
 			Key:   "lasso.gvk.group",
-			Value: attribute.StringValue(c.gvk.Group),
+			Value: attribute.StringValue(gvk.Group),
 		},
 		attribute.KeyValue{
 			Key:   "lasso.gvk.version",
-			Value: attribute.StringValue(c.gvk.Version),
+			Value: attribute.StringValue(gvk.Version),
 		},
 		attribute.KeyValue{
 			Key:   "lasso.gvk.kind",
-			Value: attribute.StringValue(c.gvk.Kind),
+			Value: attribute.StringValue(gvk.Kind),
 		},
 	))
 	if key, ok := obj.(string); ok {

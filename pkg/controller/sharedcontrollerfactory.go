@@ -268,6 +268,7 @@ func (s *sharedControllerFactory) ForResourceKindContext(gvr schema.GroupVersion
 				RateLimiter:            rateLimiter,
 				SyncOnlyChangedObjects: s.syncOnlyChangedObjects,
 				Tracer:                 s.tracer,
+				GVK:                    gvk,
 			})
 
 			return c, err
