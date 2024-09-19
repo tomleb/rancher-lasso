@@ -92,26 +92,37 @@ func (f *CacheFactory) CacheFor(fields [][]string, transform cache.TransformFunc
 	f.mutex.RLock()
 	defer f.mutex.RUnlock()
 
+	// We don't want to hold this lock for very long because that prevents
+	// CacheFor for other GVKs
 	f.informersMutex.Lock()
 	gi, ok := f.informers[gvk]
 	if !ok {
+		gi = &guardedInformer{
+			informer: nil,
+			mutex:    &sync.Mutex{},
+		}
+		f.informers[gvk] = gi
+	}
+	f.informersMutex.Unlock()
+
+	// We only want to create a new informer and start it if it hasn't been
+	// done before
+	gi.mutex.Lock()
+	if gi.informer == nil {
 		_, encryptResourceAlways := defaultEncryptedResourceTypes[gvk]
 		shouldEncrypt := f.encryptAll || encryptResourceAlways
 		i, err := f.newInformer(client, fields, transform, gvk, f.dbClient, shouldEncrypt, namespaced)
 		if err != nil {
-			f.informersMutex.Unlock()
+			gi.mutex.Unlock()
 			return Cache{}, err
 		}
 
-		gi = &guardedInformer{
-			informer: i,
-			mutex:    &sync.Mutex{},
-		}
-		f.informers[gvk] = gi
 		// Start the channel (doesn't block)
 		f.wg.StartWithChannel(f.stopCh, i.Run)
 	}
-	f.informersMutex.Unlock()
+	gi.mutex.Unlock()
+
+	// Everyone should have to wait (no need to block anything at this point)
 
 	if !cache.WaitForCacheSync(f.stopCh, gi.informer.HasSynced) {
 		return Cache{}, fmt.Errorf("failed to sync SQLite Informer cache for GVK %v", gvk)
