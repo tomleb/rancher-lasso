@@ -6,7 +6,6 @@ import (
 	"encoding/gob"
 	"errors"
 	"fmt"
-	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -36,7 +35,6 @@ type ListOptionIndexer struct {
 var (
 	defaultIndexedFields   = []string{"metadata.name", "metadata.creationTimestamp"}
 	defaultIndexNamespaced = "metadata.namespace"
-	subfieldRegex          = regexp.MustCompile(`([a-zA-Z]+)|(\[[a-zA-Z./]+])|(\[[0-9]+])`)
 
 	InvalidColumnErr = errors.New("supplied column is invalid")
 )
@@ -473,7 +471,10 @@ func toColumnName(s []string) string {
 
 // getField extracts the value of a field expressed as a string path from an unstructured object
 func getField(a any, field string) (any, error) {
-	subFields := extractSubFields(field)
+	subFields, err := extractSubFields(field)
+	if err != nil {
+		return nil, fmt.Errorf("extracting subfield: %w", err)
+	}
 	o, ok := a.(*unstructured.Unstructured)
 	if !ok {
 		return nil, fmt.Errorf("unexpected object type, expected unstructured.Unstructured: %v", a)
@@ -481,7 +482,6 @@ func getField(a any, field string) (any, error) {
 
 	var obj interface{}
 	var found bool
-	var err error
 	obj = o.Object
 	for i, subField := range subFields {
 		switch t := obj.(type) {
@@ -528,12 +528,45 @@ func getField(a any, field string) (any, error) {
 	return obj, nil
 }
 
-func extractSubFields(fields string) []string {
-	subfields := make([]string, 0)
-	for _, subField := range subfieldRegex.FindAllString(fields, -1) {
-		subfields = append(subfields, strings.TrimSuffix(subField, "."))
+func extractSubFields(fields string) ([]string, error) {
+	var subFields []string
+
+	for {
+		idx := strings.IndexAny(fields, "[.")
+		if idx < 0 {
+			if len(fields) > 0 {
+				subFields = append(subFields, fields)
+			}
+			return subFields, nil
+		}
+		switch fields[idx] {
+		case '[':
+			// At this point we have something like:
+			// foo[bar]
+			//    ^-- idx
+			// so we must make a subfield for foo
+			subField := fields[:idx]
+			subFields = append(subFields, subField)
+			fields = fields[idx:]
+
+			// And then we search for the closing parenthese and make
+			// a subfield for [bar] (parens included)
+			parentIdx := strings.IndexByte(fields, ']')
+			if parentIdx < 0 {
+				return nil, fmt.Errorf("missing closing parentheses for field %s", fields)
+			}
+			subField = fields[:parentIdx+1]
+			subFields = append(subFields, subField)
+			fields = fields[parentIdx+1:]
+			if len(fields) > 0 && fields[0] == '.' {
+				fields = fields[1:]
+			}
+		case '.':
+			subField := fields[:idx]
+			subFields = append(subFields, subField)
+			fields = fields[idx+1:]
+		}
 	}
-	return subfields
 }
 
 // toUnstructuredList turns a slice of unstructured objects into an unstructured.UnstructuredList

@@ -23,6 +23,102 @@ import (
 	"github.com/rancher/lasso/pkg/cache/sql/partition"
 )
 
+func TestGetField(t *testing.T) {
+	tests := []struct {
+		obj         any
+		field       string
+		expected    any
+		expectedErr bool
+	}{
+		{
+			field: "metadata.name",
+			obj: &unstructured.Unstructured{
+				Object: map[string]any{
+					"metadata": map[string]any{
+						"name": "foo",
+					},
+				},
+			},
+			expected: "foo",
+		},
+		{
+			field: "metadata.annotations[foo]",
+			obj: &unstructured.Unstructured{
+				Object: map[string]any{
+					"metadata": map[string]any{
+						"name": "bar",
+						"annotations": map[string]any{
+							"foo": "bar",
+						},
+					},
+				},
+			},
+			expected: "bar",
+		},
+		{
+			field: "metadata.annotations[foo.kubernetes.io]",
+			obj: &unstructured.Unstructured{
+				Object: map[string]any{
+					"metadata": map[string]any{
+						"name": "bar",
+						"annotations": map[string]any{
+							"foo.kubernetes.io": "bar",
+						},
+					},
+				},
+			},
+			expected: "bar",
+		},
+		{
+			field: "spec.ips[1]",
+			obj: &unstructured.Unstructured{
+				Object: map[string]any{
+					"spec": map[string]any{
+						"ips": []any{
+							"127.0.0.1",
+							"::1",
+						},
+					},
+				},
+			},
+			expected: "::1",
+		},
+		{
+			field: "spec.containers.name",
+			obj: &unstructured.Unstructured{
+				Object: map[string]any{
+					"spec": map[string]any{
+						"containers": []any{
+							map[string]any{
+								"name": "foo",
+							},
+							map[string]any{
+								"name": "bar",
+							},
+						},
+					},
+				},
+			},
+			expected: []string{"foo", "bar"},
+		},
+		{
+			field:       "metadata.annotations[foo.kubernetes.io",
+			expectedErr: true,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.field, func(t *testing.T) {
+			val, err := getField(test.obj, test.field)
+			if test.expectedErr {
+				assert.Error(t, err)
+			} else {
+				assert.NoError(t, err)
+				assert.Equal(t, test.expected, val)
+			}
+		})
+	}
+}
+
 func TestNewListOptionIndexer(t *testing.T) {
 	type testCase struct {
 		description string
