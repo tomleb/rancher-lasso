@@ -20,10 +20,12 @@ type SharedCacheFactoryOptions struct {
 	DefaultNamespace string
 	DefaultTweakList TweakListOptionsFunc
 
-	KindResync     map[schema.GroupVersionKind]time.Duration
-	KindNamespace  map[schema.GroupVersionKind]string
-	KindTweakList  map[schema.GroupVersionKind]TweakListOptionsFunc
-	HealthCallback func(healthy bool)
+	KindResync              map[schema.GroupVersionKind]time.Duration
+	KindNamespace           map[schema.GroupVersionKind]string
+	KindTweakList           map[schema.GroupVersionKind]TweakListOptionsFunc
+	KindDisableWatchList    map[schema.GroupVersionKind]bool
+	DefaultDisableWatchList bool
+	HealthCallback          func(healthy bool)
 
 	// Determines how often metrics are gathered about how many resources are
 	// cached by gvk across all caches in the sharedCacheFactory
@@ -36,10 +38,12 @@ type sharedCacheFactory struct {
 	tweakList           TweakListOptionsFunc
 	defaultResync       time.Duration
 	defaultNamespace    string
-	customResync        map[schema.GroupVersionKind]time.Duration
-	customNamespaces    map[schema.GroupVersionKind]string
-	customTweakList     map[schema.GroupVersionKind]TweakListOptionsFunc
-	sharedClientFactory client.SharedClientFactory
+	customResync            map[schema.GroupVersionKind]time.Duration
+	customNamespaces        map[schema.GroupVersionKind]string
+	customTweakList         map[schema.GroupVersionKind]TweakListOptionsFunc
+	customDisableWatchList  map[schema.GroupVersionKind]bool
+	defaultDisableWatchList bool
+	sharedClientFactory     client.SharedClientFactory
 	healthcheck         healthcheck
 
 	caches        map[schema.GroupVersionKind]cache.SharedIndexInformer
@@ -57,10 +61,12 @@ func NewSharedCachedFactory(sharedClientFactory client.SharedClientFactory, opts
 		tweakList:           opts.DefaultTweakList,
 		defaultResync:       opts.DefaultResync,
 		defaultNamespace:    opts.DefaultNamespace,
-		customResync:        opts.KindResync,
-		customNamespaces:    opts.KindNamespace,
-		customTweakList:     opts.KindTweakList,
-		caches:              map[schema.GroupVersionKind]cache.SharedIndexInformer{},
+		customResync:            opts.KindResync,
+		customNamespaces:        opts.KindNamespace,
+		customTweakList:         opts.KindTweakList,
+		customDisableWatchList:  opts.KindDisableWatchList,
+		defaultDisableWatchList: opts.DefaultDisableWatchList,
+		caches:                  map[schema.GroupVersionKind]cache.SharedIndexInformer{},
 		startedCaches:       map[schema.GroupVersionKind]bool{},
 		sharedClientFactory: sharedClientFactory,
 		healthcheck: healthcheck{
@@ -200,6 +206,11 @@ func (f *sharedCacheFactory) ForResourceKind(gvr schema.GroupVersionResource, ki
 		tweakList = f.tweakList
 	}
 
+	disableWatchList, ok := f.customDisableWatchList[gvk]
+	if !ok {
+		disableWatchList = f.defaultDisableWatchList
+	}
+
 	obj, objList, err := f.sharedClientFactory.NewObjects(gvk)
 	if err != nil {
 		return nil, err
@@ -208,10 +219,11 @@ func (f *sharedCacheFactory) ForResourceKind(gvr schema.GroupVersionResource, ki
 	client := f.sharedClientFactory.ForResourceKind(gvr, kind, namespaced)
 
 	cache := NewCache(obj, objList, client, &Options{
-		Namespace:   namespace,
-		Resync:      resyncPeriod,
-		TweakList:   tweakList,
-		WaitHealthy: f.healthcheck.ensureHealthy,
+		Namespace:        namespace,
+		Resync:           resyncPeriod,
+		TweakList:        tweakList,
+		WaitHealthy:      f.healthcheck.ensureHealthy,
+		DisableWatchList: disableWatchList,
 	})
 	f.caches[gvk] = cache
 
